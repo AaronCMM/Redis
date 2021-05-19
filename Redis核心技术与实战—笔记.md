@@ -406,5 +406,58 @@ GET hello:key
 
 <font color=red>和 MOVED 命令不同，ASK 命令并不会更新客户端缓存的哈希槽分配信息。</font>
 
+
+
 ## [ 实践篇 ]
 
+### （八）万金油的String，为什么不好用了？
+
+<img src="https://i.loli.net/2021/05/19/Upx9Cl6Q5B2RLD8.jpg" alt="img" style="zoom:15%;" />
+
+保存1 亿张图片的信息，其中保存图片 ID 和图片存储对象 ID（long 类型）。用 int 编码，就16字节，两个ID就是32字节。
+
+Redis 会<font color=red>使用一个全局哈希表保存所有键值对</font>，哈希表的每一项是一个 dictEntry 的结构体，用来指向一个键值对。<font color=red>dictEntry 结构中有三个 8 字节的指针</font>，分别指向 key、value 以及下一个 dictEntry，三个指针共 24 字节。
+
+<img src="https://static001.geekbang.org/resource/image/b6/e7/b6cbc5161388fdf4c9b49f3802ef53e7.jpg" alt="img" style="zoom:15%;" />
+
+Redis 使用的内存分配库 jemalloc ，jemalloc 在分配内存时，会根据我们申请的字节数 N，找一个比 N 大，但是最接近 N 的 2 的幂次数作为分配的空间，这样可以减少频繁分配的次数。
+
+<font color=blue>所以，dictEntry 结构就占用了 32 字节。</font>
+
+所以，保存图片 ID 和图片存储对象 ID，共需要 32+32=64字节内存。而明明有效信息才16字节，如果要保存的图片有 1 亿张，那么 1 亿条的图片 ID 记录就需要 6.4GB 内存空间。
+
+#### 8.1 用什么数据结构可以节省内存？
+
+Redis 有一种底层数据结构，叫<font color=blue>压缩列表（ziplist），这是一种非常节省内存的结构。</font>
+
+<img src="https://static001.geekbang.org/resource/image/f6/9f/f6d4df5f7d6e80de29e2c6446b02429f.jpg" alt="img" style="zoom:15%;" />
+
+<font color=red>压缩列表之所以能节省内存，就在于它是用一系列连续的 entry 保存数据。</font>这些 entry 会挨个儿放置在内存中，<font color=red>不需要再用额外的指针进行连接</font>，这样就可以节省指针所占用的空间。
+
+Redis **基于压缩列表实现了 List、Hash 和 Sorted Set 这样的集合类型**，这样做的最大好处就是节省了 dictEntry 的开销。当你用 String 类型时，一个键值对就有一个 dictEntry，要用 32 字节空间。但采用集合类型时，一个 key 就对应一个集合的数据，能保存的数据多了很多，但也只用了一个 dictEntry，这样就节省了内存。
+
+#### 8.2 如何用集合类型保存单值的键值对？
+
+可以采用基于 Hash 类型的二级编码方法。
+
+把一个单值的数据拆分成两部分，前一部分作为 Hash 集合的 key，后一部分作为 Hash 集合的 value，这样一来，就可以把单值数据保存到 Hash 集合中了。
+
+### （九）Redis 的基本对象结构
+
+RedisObject 的内部组成包括了 type、encoding、lru 和 refcount 4 个元数据，以及 1 个*ptr指针。
+
+- type：表示值的类型，涵盖了五大基本类型；
+- encoding：是值的编码方式，用来表示 Redis 中实现各个基本类型的底层数据结构，例如 SDS、压缩列表、哈希表、跳表等；
+- lru：记录了这个对象最后一次被访问的时间，用于淘汰过期的键值对；
+- refcount：记录了对象的引用计数；
+- *ptr：是指向数据的指针。
+
+<img src="https://static001.geekbang.org/resource/image/05/af/05c2d546e507d8a863c002e2173c71af.jpg" alt="img" style="zoom:20%;" />
+
+RedisObject 结构借助 <font color=red> *ptr指针，就可以指向不同的数据类型</font>，例如，ptr 指向一个 SDS 或一个跳表，就表示键值对中的值是 String 类型或 Sorted Set 类型
+
+### Redis 的扩展数据类型 GEO
+
+GEO 可以记录经纬度形式的地理位置信息，被广泛地应用在 LBS 服务中。GEO 本身并没有设计新的底层数据结构，而是直接使用了 Sorted Set 集合类型。
+
+GEO 类型使用 GeoHash 编码方法实现了经纬度到 Sorted Set 中元素权重分数的转换，这其中的两个关键机制就是对二维地图做区间划分，以及对区间进行编码
